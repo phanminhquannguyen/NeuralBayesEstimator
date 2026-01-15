@@ -1,0 +1,5 @@
+*.jld2
+*.rds
+*.csv
+sweeps/
+.DS_Store
