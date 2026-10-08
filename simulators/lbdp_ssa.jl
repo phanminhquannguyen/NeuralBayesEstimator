@@ -1,21 +1,27 @@
+# ============================================================
+# lbdp_ssa.jl
+#
+# Linear Birth-Death Process (LBDP) simulator by Gillespie SSA,
+# with optional non-extinction (rejection / multilevel splitting).
+#
+# Usage:
+#   julia --project=. simulators/lbdp_ssa.jl <mode> <M> <dt> <tmax> <K_train> <K_val> <K_test> <r_max>
+#   (all args optional; mode = "extinct" | "non_extinct")
+#
+# Saves: data/lbdp_extinct.jld2 | data/lbdp_non_extinct.jld2
+# ============================================================
 
-# Linear Birth–Death Process (LBDP) simulator by Gillespie SSA + optional non-extinction
-
-
-# Load neccessary packages
 using Random
 using Dates
 using Distributions
 using JLD2
 
+include("common.jl")
 
-# Prior sampler: Theta is 2×K with rows (lambda, mu), we can change the r_max to adjust prior range
-function sample_theta(K::Int; r_max::Real = 5.0)
-    lambda = rand(Uniform(0, r_max), K)
-    mu     = rand(Uniform(0, r_max), K)
-    return vcat(reshape(lambda, 1, :), reshape(mu, 1, :))  # 2×K
-end
-
+# Prior sampler: Theta is 2xK with rows (lambda, mu); r_max sets the prior
+# range, delta caps |lambda - mu| to avoid extreme regimes.
+sample_theta(K::Int; r_max::Real = 6.0, delta::Real = 2) =
+    sample_theta_constrained(K; r_max = r_max, delta = delta, cmp = >)
 
 #  Event-based Gillespie SSA on [0, horizon]
 function simulate_interval_bdp(z0::Integer, lambda::Real, mu::Real, horizon::Real)
@@ -47,20 +53,6 @@ function simulate_interval_bdp(z0::Integer, lambda::Real, mu::Real, horizon::Rea
     return (times = times, states = states)
 end
 
-# Sample event-based trajectory on a fixed grid
-function sample_on_grid(grid_times::AbstractVector{<:Real},
-                        event_times::AbstractVector{<:Real},
-                        event_states::AbstractVector{<:Integer})
-    Z = Vector{Int}(undef, length(grid_times))
-    @inbounds for i in eachindex(grid_times)
-        j = searchsortedlast(event_times, grid_times[i])
-        j = max(j, 1)
-        Z[i] = event_states[j]
-    end
-    return Z
-end
-
-
 # Unconditional simulation (extinction allowed)
 function simulate_bdp(times::AbstractVector{<:Real},
                       z0::Integer, mu::Real, lambda::Real)
@@ -76,9 +68,21 @@ function simulate_bdp(times::AbstractVector{<:Real},
     return (time = collect(times), Z = Z)
 end
 
+# Critical / supercritical NON-EXTINCT simulation via simple rejection:
+# simulate until horizon; if extinct by tmax, discard and resimulate.
+function simulate_bdp_nonextinct_reject(times::AbstractVector{<:Real},
+    z0::Integer, mu::Real, lambda::Real;
+    max_restarts::Integer = 1000)
+for _ in 1:max_restarts
+out = simulate_bdp(times, z0, mu, lambda)
+if out.Z[end] > 0
+return out
+end
+end
+error("Failed to produce a non-extinct trajectory within max_restarts (reject sampler).")
+end
 
 # Subcritical NON-EXTINCT simulation via multilevel splitting
-
 function simulate_bdp_sub_nonextinct(times::AbstractVector{<:Real},
                                      z0::Integer, mu::Real, lambda::Real;
                                      branch::Integer = 2,
@@ -179,7 +183,6 @@ function simulate_bdp_sub_nonextinct(times::AbstractVector{<:Real},
     error("Failed to produce a non-extinct subcritical trajectory within max_restarts.")
 end
 
-
 # Simulate datasets for NBE
 function simulate_lbdp_for_NBE(Theta::AbstractMatrix, m::Int, times;
                                non_extinct::Bool = false,
@@ -196,24 +199,33 @@ function simulate_lbdp_for_NBE(Theta::AbstractMatrix, m::Int, times;
         lambda = Theta[1, k]
         mu     = Theta[2, k]
 
-        # random initial population (shared across the m replicates for this theta)
-        z0 = rand(z0_range)
+        # fixed initial population for all replicates of this theta
+        z0 = 5
 
         Zk = Matrix{Int}(undef, T, m)
 
-        # Choose simulator:
-        # - if non_extinct=true AND subcritical (lambda < mu), enforce survival via splitting
-        # - otherwise simulate normally (extinction allowed)
-        if non_extinct && lambda < mu
-            for i in 1:m
-                Zk[:, i] = simulate_bdp_sub_nonextinct(
-                    times, z0, mu, lambda;
-                    branch = branch,
-                    survival_target = survival_target,
-                    max_restarts = max_restarts
-                ).Z
+        if non_extinct
+            if lambda < mu
+                # subcritical: use splitting (your current behavior)
+                for i in 1:m
+                    Zk[:, i] = simulate_bdp_sub_nonextinct(
+                        times, z0, mu, lambda;
+                        branch = branch,
+                        survival_target = survival_target,
+                        max_restarts = max_restarts
+                    ).Z
+                end
+            else
+                # critical/supercritical: reject extinct trajectories until non-extinct at tmax
+                for i in 1:m
+                    Zk[:, i] = simulate_bdp_nonextinct_reject(
+                        times, z0, mu, lambda;
+                        max_restarts = max_restarts
+                    ).Z
+                end
             end
         else
+            # extinction allowed
             for i in 1:m
                 Zk[:, i] = simulate_bdp(times, z0, mu, lambda).Z
             end
@@ -225,25 +237,22 @@ function simulate_lbdp_for_NBE(Theta::AbstractMatrix, m::Int, times;
     return Z_list
 end
 
-
 # generate train / val / test datasets and save
 function main()
     # -----------------------------
-    # Defaults (same as your current)
+    # Defaults (same as original)
     # -----------------------------
     mode    = "non_extinct"   # "extinct" or "non_extinct"
-    M       = 20
+    M       = 1
     dt      = 0.1
-    tmax    = 1.9
-    K_train = 10_000
-    K_val   = 2_000
-    K_test  = 2_000
+    tmax    = 6
+    K_train = 10000
+    K_val   = 2000
+    K_test  = 2000
     r_max   = 5.0
     seed    = 1
 
-
-    # Usage: (must provide in order and all aruguments)
-    # julia simulator.jl <mode> <M> <dt> <tmax> <K_train> <K_val> <K_test> <r_max>
+    # julia lbdp_ssa.jl <mode> <M> <dt> <tmax> <K_train> <K_val> <K_test> <r_max>
 
     if length(ARGS) >= 1
         mode = ARGS[1]
@@ -299,9 +308,15 @@ function main()
     Z_test  = simulate_lbdp_for_NBE(theta_test, m, times; non_extinct = non_extinct)
 
     # output name depends on mode
-    out_file = non_extinct ? "nbe_lbdp_non_extinct.jld2" : "nbe_lbdp_extinct.jld2"
+    mkpath("data")
+    out_file = non_extinct ? "data/lbdp_non_extinct.jld2" : "data/lbdp_extinct.jld2"
 
     @save out_file theta_train theta_val theta_test Z_train Z_val Z_test times m T K_train K_val K_test r_max non_extinct
 
     println("Saved dataset to ", out_file)
+end
+
+# Only run main if this script is executed directly (not imported)
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
 end

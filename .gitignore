@@ -3,3 +3,4 @@
 *.csv
 sweeps/
 .DS_Store
+.Rapp.history
